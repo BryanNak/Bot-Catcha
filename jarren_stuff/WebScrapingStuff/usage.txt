@@ -1,0 +1,3 @@
+$env:BLUESKY_HANDLE="your.handle.bsky.social"
+$env:BLUESKY_APP_PASSWORD="xxxx-xxxx-xxxx-xxxx"
+python .\bluesky_keyword_timeseries.py --keyword "climate change" --start-date 2025-01-01 --end-date 2025-01-31 --output-path climate_change_jan_2025.csv --output-format csv --lang en --page-size 100 --sleep-seconds 1.0 --window-days 7 --authenticated
