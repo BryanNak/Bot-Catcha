@@ -32,6 +32,7 @@ To stay cautious, this script:
 from __future__ import annotations
 
 import argparse
+import concurrent.futures as futures
 import csv
 import getpass
 import json
@@ -39,6 +40,7 @@ import logging
 import os
 import re
 import sys
+import threading
 import time
 from dataclasses import asdict, dataclass
 from datetime import date, datetime, time as dt_time, timedelta, timezone
@@ -88,6 +90,10 @@ OUTPUT_FIELD_ORDER = [
 
 class BlueskyRequestError(RuntimeError):
     """Raised when an HTTP request fails in a non-recoverable way."""
+
+
+class BlueskyCursorPaginationForbidden(BlueskyRequestError):
+    """Raised for the known public AppView search cursor 403 behavior."""
 
 
 @dataclass(frozen=True)
@@ -193,6 +199,15 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--parallel-workers",
+        type=int,
+        default=1,
+        help=(
+            "Number of independent date windows to collect concurrently. Cursor pages "
+            "inside each window remain sequential. Default: 1."
+        ),
+    )
+    parser.add_argument(
         "--authenticated",
         action="store_true",
         help=(
@@ -268,6 +283,8 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--backoff-base-seconds must be zero or greater.")
     if args.window_days < 1:
         raise ValueError("--window-days must be at least 1.")
+    if args.parallel_workers < 1:
+        raise ValueError("--parallel-workers must be at least 1.")
 
     start_date = parse_iso_date(args.start_date)
     end_date = parse_iso_date(args.end_date)
@@ -334,11 +351,7 @@ def to_iso8601_z(dt: Optional[datetime]) -> str:
     return dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
-def iter_windows(
-    start_dt: datetime,
-    end_exclusive: datetime,
-    window_days: int,
-) -> Iterator[Tuple[datetime, datetime]]:
+def iter_windows(start_dt: datetime, end_exclusive: datetime, window_days: int) -> Iterator[Tuple[datetime, datetime]]:
     cursor = start_dt
     step = timedelta(days=window_days)
     while cursor < end_exclusive:
@@ -448,6 +461,36 @@ def choose_preferred_record(
     return existing
 
 
+@dataclass(frozen=True)
+class WindowCollectionResult:
+    records: Dict[str, NormalizedPostRecord]
+    pages: int
+    received: int
+
+
+class PoliteRateLimiter:
+    """Thread-safe global request spacing across all worker clients."""
+
+    def __init__(self, sleep_seconds: float) -> None:
+        self.sleep_seconds = sleep_seconds
+        self._last_request_monotonic = 0.0
+        self._lock = threading.Lock()
+
+    def wait(self) -> None:
+        if self.sleep_seconds <= 0:
+            return
+
+        with self._lock:
+            now = time.monotonic()
+            elapsed = now - self._last_request_monotonic
+            if elapsed < self.sleep_seconds:
+                sleep_for = self.sleep_seconds - elapsed
+                LOGGER.debug("Global rate limiter sleeping %.2fs", sleep_for)
+                time.sleep(sleep_for)
+                now = time.monotonic()
+            self._last_request_monotonic = now
+
+
 class BlueskyAPIClient:
     """Small API client with polite rate limiting and retry/backoff."""
 
@@ -459,6 +502,7 @@ class BlueskyAPIClient:
         max_retries: int,
         backoff_base_seconds: float,
         auth_service: Optional[str] = None,
+        rate_limiter: Optional[PoliteRateLimiter] = None,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.auth_service = auth_service.rstrip("/") if auth_service else None
@@ -466,12 +510,30 @@ class BlueskyAPIClient:
         self.sleep_seconds = sleep_seconds
         self.max_retries = max_retries
         self.backoff_base_seconds = backoff_base_seconds
+        self.rate_limiter = rate_limiter
         self._last_request_monotonic = 0.0
         self._access_jwt: Optional[str] = None
         self._refresh_jwt: Optional[str] = None
 
         self.session = requests.Session()
         self.session.headers.update(REQUEST_HEADERS)
+
+    def clone_for_worker(self) -> "BlueskyAPIClient":
+        """Create a per-thread client while sharing the global rate limiter."""
+        client = BlueskyAPIClient(
+            base_url=self.base_url,
+            timeout_seconds=self.timeout_seconds,
+            sleep_seconds=self.sleep_seconds,
+            max_retries=self.max_retries,
+            backoff_base_seconds=self.backoff_base_seconds,
+            auth_service=self.auth_service,
+            rate_limiter=self.rate_limiter,
+        )
+        client._access_jwt = self._access_jwt
+        client._refresh_jwt = self._refresh_jwt
+        if self._access_jwt:
+            client.session.headers["Authorization"] = f"Bearer {self._access_jwt}"
+        return client
 
     def authenticate(self, identifier: str, password: str) -> None:
         if not self.auth_service:
@@ -501,7 +563,30 @@ class BlueskyAPIClient:
             raise BlueskyRequestError("Unexpected response shape: expected a JSON object.")
         return data
 
+    def _is_known_search_cursor_forbidden(
+        self,
+        url: str,
+        params: Optional[Dict[str, Any]],
+        response: requests.Response,
+    ) -> bool:
+        if response.status_code != 403:
+            return False
+        if not url.endswith(SEARCH_POSTS_PATH):
+            return False
+        if not params or "cursor" not in params:
+            return False
+        if self.session.headers.get("Authorization"):
+            return False
+        return self.base_url.rstrip("/") in {
+            "https://public.api.bsky.app",
+            "https://api.bsky.app",
+        }
+
     def _sleep_for_rate_limit(self) -> None:
+        if self.rate_limiter:
+            self.rate_limiter.wait()
+            return
+
         if self.sleep_seconds <= 0:
             return
 
@@ -585,6 +670,16 @@ class BlueskyAPIClient:
                         response=response,
                     )
 
+                if self._is_known_search_cursor_forbidden(url, params, response):
+                    preview = response.text[:300].strip().replace("\n", " ")
+                    raise BlueskyCursorPaginationForbidden(
+                        "Public Bluesky AppView search returned HTTP 403 when using the "
+                        "'cursor' parameter. This appears to be a known issue with "
+                        "app.bsky.feed.searchPosts pagination on public AppView hosts. "
+                        "Try --authenticated, narrow the query/date window so one page is "
+                        f"enough, or retry later. Response preview: {preview}"
+                    )
+
                 if response.status_code >= 400:
                     preview = response.text[:300].strip().replace("\n", " ")
                     raise BlueskyRequestError(
@@ -600,19 +695,15 @@ class BlueskyAPIClient:
                     )
 
                 return response.json()
-            except (
-                requests.Timeout,
-                requests.ConnectionError,
-                requests.HTTPError,
-                ValueError,
-                BlueskyRequestError,
-            ) as exc:
+            except (requests.Timeout, requests.ConnectionError, requests.HTTPError, ValueError, BlueskyRequestError) as exc:
                 last_error = exc
 
                 retryable = True
                 retry_after_seconds: Optional[float] = None
 
-                if isinstance(exc, BlueskyRequestError):
+                if isinstance(exc, BlueskyCursorPaginationForbidden):
+                    retryable = False
+                elif isinstance(exc, BlueskyRequestError):
                     retryable = False
 
                 if isinstance(exc, requests.HTTPError):
@@ -660,105 +751,100 @@ class BlueskyKeywordCollector:
         lang: Optional[str],
         window_days: int,
         max_results: Optional[int],
+        parallel_workers: int,
     ) -> List[NormalizedPostRecord]:
+        windows = list(iter_windows(start_dt, end_exclusive, window_days))
         deduped: Dict[str, NormalizedPostRecord] = {}
         total_pages = 0
         total_received = 0
+        stop_event = threading.Event()
 
-        for window_start, window_end in iter_windows(start_dt, end_exclusive, window_days):
-            window_label = (
-                f"{to_iso8601_z(window_start)} -> "
-                f"{to_iso8601_z(window_end - timedelta(microseconds=1))}"
-            )
-            cursor: Optional[str] = None
-            seen_cursors: set[str] = set()
-            page_number = 0
+        if parallel_workers <= 1 or len(windows) <= 1:
+            for window_start, window_end in windows:
+                remaining = None
+                if max_results is not None:
+                    remaining = max(max_results - len(deduped), 0)
+                    if remaining <= 0:
+                        break
 
-            LOGGER.info("Collecting search window %s", window_label)
-
-            while True:
-                params: Dict[str, Any] = {
-                    "q": keyword,
-                    "sort": "latest",
-                    "since": to_iso8601_z(window_start),
-                    "until": to_iso8601_z(window_end),
-                    "limit": page_size,
-                }
-                if lang:
-                    params["lang"] = lang
-                if cursor:
-                    params["cursor"] = cursor
-
-                payload = self.client.search_posts(params)
-                posts = payload.get("posts")
-                next_cursor = safe_str(payload.get("cursor")) or None
-                hits_total = payload.get("hitsTotal")
-
-                if not isinstance(posts, list):
-                    raise BlueskyRequestError("Unexpected response shape: 'posts' is not a list.")
-
-                page_number += 1
-                total_pages += 1
-                total_received += len(posts)
-                kept_in_page = 0
-                skipped_missing_created = 0
-
-                for item in posts:
-                    if not isinstance(item, dict):
-                        continue
-
-                    normalized = normalize_post(keyword=keyword, post_view=item)
-                    if normalized is None:
-                        continue
-
-                    created_dt = parse_bsky_datetime(normalized.created_at_raw)
-                    if created_dt is None:
-                        skipped_missing_created += 1
-                        LOGGER.warning(
-                            "Skipping post without parseable createdAt: %s",
-                            normalized.post_uri,
-                        )
-                        continue
-
-                    if not (start_dt <= created_dt < end_exclusive):
-                        continue
-
-                    existing = deduped.get(normalized.post_uri)
-                    if existing is None:
-                        deduped[normalized.post_uri] = normalized
-                    else:
-                        deduped[normalized.post_uri] = choose_preferred_record(
-                            existing=existing,
-                            incoming=normalized,
-                        )
-                    kept_in_page += 1
-
-                LOGGER.info(
-                    "Window page %s | received=%s kept_in_range=%s skipped_missing_created=%s "
-                    "unique_total=%s hits_total=%s",
-                    page_number,
-                    len(posts),
-                    kept_in_page,
-                    skipped_missing_created,
-                    len(deduped),
-                    hits_total,
+                result = self._collect_window(
+                    client=self.client,
+                    keyword=keyword,
+                    start_dt=start_dt,
+                    end_exclusive=end_exclusive,
+                    window_start=window_start,
+                    window_end=window_end,
+                    page_size=page_size,
+                    lang=lang,
+                    stop_event=stop_event,
+                    local_max_results=remaining,
                 )
+                total_pages += result.pages
+                total_received += result.received
+                self._merge_records(deduped, result.records)
 
                 if max_results is not None and len(deduped) >= max_results:
                     LOGGER.info("Reached max-results=%s; stopping collection.", max_results)
-                    return self._finalize_records(deduped, max_results)
-
-                if not posts or not next_cursor:
                     break
+        else:
+            worker_count = min(parallel_workers, len(windows))
+            LOGGER.info(
+                "Collecting %s search windows with %s parallel workers. "
+                "Cursor pages inside each window remain sequential.",
+                len(windows),
+                worker_count,
+            )
+            executor = futures.ThreadPoolExecutor(max_workers=worker_count)
+            future_to_window: Dict[futures.Future[WindowCollectionResult], Tuple[datetime, datetime]] = {}
 
-                if next_cursor in seen_cursors:
-                    LOGGER.warning(
-                        "Search cursor repeated within window; stopping this window to avoid loop."
+            try:
+                for window_start, window_end in windows:
+                    worker_client = self.client.clone_for_worker()
+                    future = executor.submit(
+                        self._collect_window,
+                        worker_client,
+                        keyword,
+                        start_dt,
+                        end_exclusive,
+                        window_start,
+                        window_end,
+                        page_size,
+                        lang,
+                        stop_event,
+                        max_results,
                     )
-                    break
+                    future_to_window[future] = (window_start, window_end)
 
-                seen_cursors.add(next_cursor)
-                cursor = next_cursor
+                for future in futures.as_completed(future_to_window):
+                    window_start, window_end = future_to_window[future]
+                    try:
+                        result = future.result()
+                    except Exception:
+                        stop_event.set()
+                        for pending in future_to_window:
+                            pending.cancel()
+                        LOGGER.error(
+                            "Parallel collection failed for window %s -> %s",
+                            to_iso8601_z(window_start),
+                            to_iso8601_z(window_end),
+                        )
+                        raise
+
+                    total_pages += result.pages
+                    total_received += result.received
+                    self._merge_records(deduped, result.records)
+
+                    if max_results is not None and len(deduped) >= max_results:
+                        LOGGER.info(
+                            "Reached max-results=%s; asking workers to stop after their current page.",
+                            max_results,
+                        )
+                        stop_event.set()
+                        for pending in future_to_window:
+                            pending.cancel()
+                        break
+            finally:
+                executor.shutdown(wait=True, cancel_futures=True)
 
         LOGGER.info(
             "Collection finished. Pages=%s total_received=%s unique_kept=%s",
@@ -767,6 +853,134 @@ class BlueskyKeywordCollector:
             len(deduped),
         )
         return self._finalize_records(deduped, max_results)
+
+    @staticmethod
+    def _merge_records(
+        target: Dict[str, NormalizedPostRecord],
+        incoming: Dict[str, NormalizedPostRecord],
+    ) -> None:
+        for post_uri, record in incoming.items():
+            existing = target.get(post_uri)
+            if existing is None:
+                target[post_uri] = record
+            else:
+                target[post_uri] = choose_preferred_record(existing, record)
+
+    @staticmethod
+    def _collect_window(
+        client: BlueskyAPIClient,
+        keyword: str,
+        start_dt: datetime,
+        end_exclusive: datetime,
+        window_start: datetime,
+        window_end: datetime,
+        page_size: int,
+        lang: Optional[str],
+        stop_event: threading.Event,
+        local_max_results: Optional[int],
+    ) -> WindowCollectionResult:
+        window_label = (
+            f"{to_iso8601_z(window_start)} -> "
+            f"{to_iso8601_z(window_end - timedelta(microseconds=1))}"
+        )
+        cursor: Optional[str] = None
+        seen_cursors: set[str] = set()
+        page_number = 0
+        received = 0
+        deduped: Dict[str, NormalizedPostRecord] = {}
+
+        LOGGER.info("Collecting search window %s", window_label)
+
+        while not stop_event.is_set():
+            params: Dict[str, Any] = {
+                "q": keyword,
+                "sort": "latest",
+                "since": to_iso8601_z(window_start),
+                "until": to_iso8601_z(window_end),
+                "limit": page_size,
+            }
+            if lang:
+                params["lang"] = lang
+            if cursor:
+                params["cursor"] = cursor
+
+            payload = client.search_posts(params)
+            posts = payload.get("posts")
+            next_cursor = safe_str(payload.get("cursor")) or None
+            hits_total = payload.get("hitsTotal")
+
+            if not isinstance(posts, list):
+                raise BlueskyRequestError("Unexpected response shape: 'posts' is not a list.")
+
+            page_number += 1
+            received += len(posts)
+            kept_in_page = 0
+            skipped_missing_created = 0
+
+            for item in posts:
+                if not isinstance(item, dict):
+                    continue
+
+                normalized = normalize_post(keyword=keyword, post_view=item)
+                if normalized is None:
+                    continue
+
+                created_dt = parse_bsky_datetime(normalized.created_at_raw)
+                if created_dt is None:
+                    skipped_missing_created += 1
+                    LOGGER.warning(
+                        "Skipping post without parseable createdAt: %s",
+                        normalized.post_uri,
+                    )
+                    continue
+
+                if not (start_dt <= created_dt < end_exclusive):
+                    continue
+
+                existing = deduped.get(normalized.post_uri)
+                if existing is None:
+                    deduped[normalized.post_uri] = normalized
+                else:
+                    deduped[normalized.post_uri] = choose_preferred_record(
+                        existing=existing,
+                        incoming=normalized,
+                    )
+                kept_in_page += 1
+
+            LOGGER.info(
+                "Window %s page %s | received=%s kept_in_range=%s "
+                "skipped_missing_created=%s window_unique=%s hits_total=%s",
+                window_label,
+                page_number,
+                len(posts),
+                kept_in_page,
+                skipped_missing_created,
+                len(deduped),
+                hits_total,
+            )
+
+            if local_max_results is not None and len(deduped) >= local_max_results:
+                LOGGER.info(
+                    "Window %s reached local max-results=%s.",
+                    window_label,
+                    local_max_results,
+                )
+                break
+
+            if not posts or not next_cursor:
+                break
+
+            if next_cursor in seen_cursors:
+                LOGGER.warning(
+                    "Search cursor repeated within window %s; stopping this window to avoid loop.",
+                    window_label,
+                )
+                break
+
+            seen_cursors.add(next_cursor)
+            cursor = next_cursor
+
+        return WindowCollectionResult(records=deduped, pages=page_number, received=received)
 
     @staticmethod
     def _finalize_records(
@@ -843,6 +1057,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     base_url = PUBLIC_APPVIEW_BASE_URL
     auth_service = args.auth_service if args.authenticated else None
+    rate_limiter = (
+        PoliteRateLimiter(args.sleep_seconds)
+        if args.parallel_workers > 1
+        else None
+    )
 
     client = BlueskyAPIClient(
         base_url=base_url,
@@ -851,6 +1070,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         max_retries=args.max_retries,
         backoff_base_seconds=args.backoff_base_seconds,
         auth_service=auth_service,
+        rate_limiter=rate_limiter,
     )
 
     try:
@@ -867,6 +1087,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             lang=args.lang,
             window_days=args.window_days,
             max_results=args.max_results,
+            parallel_workers=args.parallel_workers,
         )
 
         output_path = Path(args.output_path)
